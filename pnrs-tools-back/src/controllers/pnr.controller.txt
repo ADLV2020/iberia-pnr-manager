@@ -1,0 +1,137 @@
+// src/controllers/pnr.controller.ts
+import type { Request, Response } from 'express';
+import { getDatabase } from '../storage/database.js';
+import * as pnrService from '../services/pnr.service.js';
+import * as soapService from '../services/soap.service.js';
+import { disruptionService } from '../services/soap.service.js';
+import { IberiaBookingService } from '../services/ndc.service.js';
+
+interface PnrRequestParams { type: string; }
+
+export const getRecords = async (req: Request<PnrRequestParams>, res: Response) => {
+    try {
+        const { type } = req.params;
+        const db = await getDatabase();
+        const tickets = await db.all('SELECT * FROM pnr_tickets WHERE flight_type = ? ORDER BY id DESC', [type]);
+        const records = [];
+
+        for (const ticket of tickets) {
+            const segments = await db.all('SELECT * FROM pnr_segments WHERE ticket_id = ? ORDER BY direction DESC, sequence ASC', [ticket.id]);
+            const goSegments = segments.filter(s => s.direction === 'GO');
+            const returnSegments = segments.filter(s => s.direction === 'RETURN');
+
+            const seg1 = goSegments[0] || {};
+            const seg2 = returnSegments[0] || goSegments[1] || {};
+
+            const paddedId = String(ticket.id).padStart(5, '0');
+            const isInvoicedCombined = seg1.is_invoiced === 'YES' || seg2.is_invoiced === 'YES' ? 'YES' : 'NOT';
+
+            const parts = [
+                paddedId, ticket.pnr, ticket.surname, ticket.is_amadeus, isInvoicedCombined,
+                seg1.origin_from || '', seg1.destination_to || '', seg1.flight || '', seg1.flight_class || '',
+                seg1.date || '', seg1.time || '', seg1.rerouting || '', seg1.disruption_type || '', seg1.export_data || '', seg1.status || 'FREE'
+            ];
+
+            if (type !== 'one-way') {
+                parts.push(
+                    seg2.origin_from || '', seg2.destination_to || '', seg2.flight || '', seg2.flight_class || '',
+                    seg2.date || '', seg2.time || '', seg2.rerouting || '', seg2.disruption_type || '', seg2.export_data || '', seg2.status || 'FREE'
+                );
+            }
+
+            records.push({ id: String(ticket.id), raw: parts.join(','), parts: parts, rawSegments: segments });
+        }
+        return res.status(200).json(records);
+    } catch (error) {
+        return res.status(500).json({ message: 'Error interno en lectura relacional.' });
+    }
+};
+
+export const saveRecord = async (req: Request, res: Response) => {
+    // ... (Se mantiene igual que tu código original) ...
+    // Omito por brevedad para centrarme en los endpoints de generación, tu saveRecord original queda igual.
+};
+
+export const updateRecord = async (req: Request, res: Response) => {
+    // ... (Se mantiene igual que tu código original) ...
+};
+
+export const triggerSoapDisruption = async (req: Request, res: Response) => {
+    // ... (Se mantiene igual) ...
+};
+
+export const checkVpnStatus = async (req: Request, res: Response) => { /* ... */ };
+export const mockInt = async (req: Request, res: Response) => { /* ... */ };
+export const mockPre = async (req: Request, res: Response) => { /* ... */ };
+export const disruptionUN = async (req: Request, res: Response) => { /* ... */ };
+export const disruptionUNTK = async (req: Request, res: Response) => { /* ... */ };
+export const disruptionFLCH = async (req: Request, res: Response) => { /* ... */ };
+
+// --- AQUI ESTAN LOS CAMBIOS DE PNR ---
+export const generatePnrV2 = async (req: Request, res: Response) => {
+  try {
+    const { origin, destination, date, returnDate, environment, firstName, surname, email, phone } = req.body;
+    
+    if (!origin || !destination || !date) {
+      return res.status(400).json({ error: 'Faltan parámetros obligatorios' });
+    }
+    
+    const service = new IberiaBookingService(environment || 'INT');
+    // Pasamos el returnDate al servicio (si existe, se asume round-trip)
+    const result = await service.executeFullFlow(
+        { origin, destination, date, returnDate }, 
+        { firstName, surname, email, phone }
+    );
+    
+    res.json({
+      success: true,
+      pnr: result.pnr,
+      orderId: result.orderId,
+      flightDetails: result.flightDetails,
+      logs: result.logs
+    });
+  } catch (error: any) {
+    console.error('Error en generatePnrV2:', error);
+    const logs = error.logs || [];
+    res.status(500).json({ success: false, error: error.message || 'Error interno', logs });
+  }
+};
+
+export const generatePnrV2Stream = async (req: Request, res: Response) => {
+  res.writeHead(200, {
+    'Content-Type': 'text/event-stream',
+    'Cache-Control': 'no-cache',
+    'Connection': 'keep-alive',
+    'Access-Control-Allow-Origin': 'http://localhost:5173'
+  });
+
+  const { origin, destination, date, returnDate, environment, firstName, surname, email, phone } = req.body;
+
+  if (!origin || !destination || !date) {
+    res.write(`event: error\ndata: ${JSON.stringify({ message: 'Faltan parámetros obligatorios' })}\n\n`);
+    res.end();
+    return;
+  }
+
+  const service = new IberiaBookingService(environment || 'INT');
+  const onLog = (log: any) => res.write(`event: log\ndata: ${JSON.stringify(log)}\n\n`);
+
+  try {
+    const result = await service.executeFullFlow(
+      { origin, destination, date, returnDate },
+      { firstName, surname, email, phone },
+      onLog
+    );
+
+    res.write(`event: success\ndata: ${JSON.stringify({
+      pnr: result.pnr,
+      orderId: result.orderId,
+      flightDetails: result.flightDetails
+    })}\n\n`);
+    res.end();
+  } catch (error: any) {
+    res.write(`event: error\ndata: ${JSON.stringify({ message: error.message || 'Error interno', logs: error.logs || [] })}\n\n`);
+    res.end();
+  }
+  
+};
